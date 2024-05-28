@@ -1,15 +1,9 @@
 # UCSD ECE276B PR3 
 
 ## Overview
-In this assignment, you will implement a controller for a car robot to track a trajectory.
-
-## Dependencies
-This starter code was tested with: python 3.7, matplotlib 3.4, and numpy 1.20. 
-
+In this assignment, two different controllers were implemented to make a ground differential-drive robot track a lissajous trajectory safely while avoiding obstacles in the way. More details can be found in the ECE276B_PR3.pdf file. 
 ## Starter code
 ### 1. main.py
-This file contains examples of how to generate control inputs from a simple P controller and apply the control on a car model. This simple controller does not work well. Your task is to replace the P controller with your own controller using CEC and GPI as described in the project statement.
+This file contains examples of how to generate control inputs from a simple P controller and apply the control on a car model.The task is to replace the P controller with our own controller using CEC and GPI as described in the project. This file contains the CEC implementation. 
 
-### 2. utils.py
-This file contains code to visualize the desired trajectory, robot's trajectory, and obstacles.
-
+![Using CEC] (/Users/dsechs/Library/CloudStorage/OneDrive-UCSanDiego/Desktop/Spring23/ECE 276B/ECE276B_PR3/fig/animation1686890140.158695.gif)
