@@ -8,3 +8,6 @@ This file contains examples of how to generate control inputs from a simple P co
 
 <img src="https://github.com/dsechsan/Trajectory-Tracking/blob/09b8302673f58925ed703b42a834186b42e50ee1/fig/animation1686890140.158695.gif" alt="Using CEC" width="400" height="400">
 
+### 2. GPI_main.py
+
+This file contains the generalized policy iteration implementation to track the given trajectory. 
