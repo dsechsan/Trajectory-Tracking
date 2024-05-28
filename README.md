@@ -6,4 +6,5 @@ In this assignment, two different controllers were implemented to make a ground 
 ### 1. main.py
 This file contains examples of how to generate control inputs from a simple P controller and apply the control on a car model.The task is to replace the P controller with our own controller using CEC and GPI as described in the project. This file contains the CEC implementation. 
 
-![Using CEC] (/Users/dsechs/Library/CloudStorage/OneDrive-UCSanDiego/Desktop/Spring23/ECE 276B/ECE276B_PR3/fig/animation1686890140.158695.gif)
+![Using CEC] (https://github.com/dsechsan/Trajectory-Tracking/tree/main/fig/animation1686890140.158695.gif)
+
