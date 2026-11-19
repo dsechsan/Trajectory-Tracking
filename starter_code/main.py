@@ -6,6 +6,9 @@ import casadi as ca
 np.random.seed(10)
 time_step = 0.5 # time between steps in seconds
 sim_time = 120    # simulation time
+position_noise_std = 0.04
+heading_noise_std = 0.004
+obstacle_clearance = 3 * position_noise_std
 
 # Car params
 x_init = 1.5
@@ -45,63 +48,93 @@ def simple_controller(cur_state, ref_state):
     w = np.clip(w, w_min, w_max)
     return [v,w]
 
-def cec_controller(cur_state,iter):
-    gamma = 1
-    q = 1
-    time_horizon = 20
+class CECController:
+    def __init__(self, horizon=20):
+        self.horizon = horizon
+        self.opti = opti = ca.Opti()
+        self.x = x = opti.variable(3, horizon + 1)
+        self.u = u = opti.variable(2, horizon)
+        self.initial_state = opti.parameter(3)
+        self.reference = reference = opti.parameter(3, horizon + 1)
+        self.previous_controls = None
 
-    T = time_horizon
-    ref_state = []
-    next_ref_state = []
-    
-    opti = ca.Opti()
-    x = opti.variable(3,T+1)
-    Q = ca.diag([1,1])
-    u_t = opti.variable(2,T)
-    R = ca.diag([1,1])
+        # Use world coordinates so each tracking error subtracts the reference once.
+        opti.subject_to(x[:, 0] == self.initial_state)
+        cost = 0
+        for t in range(horizon):
+            velocity = ca.vertcat(
+                u[0, t] * ca.cos(x[2, t]),
+                u[0, t] * ca.sin(x[2, t]),
+                u[1, t],
+            )
+            opti.subject_to(x[:, t + 1] == x[:, t] + time_step * velocity)
+            error = x[:, t] - reference[:, t]
+            cost += ca.sumsqr(error[:2]) + ca.sumsqr(u[:, t])
+            cost += 1 - ca.cos(error[2])
 
-    iter_in = iter
-    for t in range(T):
-        ref_state.append(np.array(lissajous(iter_in)).reshape([3,1]))
-        next_ref_state.append(np.array(lissajous(iter_in+1)).reshape([3,1]))
-        G_tilda = time_step*ca.horzcat(ca.vertcat(ca.cos(x[2,t]+ref_state[t][2,0]), ca.sin(x[2,t]+ref_state[t][2,0]), 0), ca.vertcat(0, 0, 1))
-        f_tilda = ca.mtimes(G_tilda,u_t[:,t])
-        opti.subject_to(x[:,t+1] == x[:,t] + f_tilda + ca.MX(ref_state[t]-next_ref_state[t]))
-        iter_in += 1
-    
-    cost = 0
-    for t in range(T-1):
-        # err_state = x[:,t]
-        cost += (gamma**t)*(ca.mtimes(ca.mtimes(x[:2,t].T,Q), x[:2,t]) + ca.mtimes(ca.mtimes(u_t[:,t].T,R), u_t[:,t]) + q*(1-ca.cos(x[2,t])**2))
-    
-    term = x[:,T]-ca.MX(lissajous(iter_in))
-    opti.minimize(cost + term[0]**2 + term[1]**2 + (1-np.cos(term[2])**2))
-    opti.subject_to(x[:,0] == (cur_state - np.array(lissajous(iter))).reshape([3,1]))
-    
+        terminal_error = x[:, horizon] - reference[:, horizon]
+        cost += ca.sumsqr(terminal_error[:2]) + 1 - ca.cos(terminal_error[2])
+        opti.minimize(cost)
 
-    for t in range(T):
-        opti.subject_to(ca.norm_2(x[:2,t] + ref_state[t][:2,0] -ca.MX([-2,-2]))>0.5)
-        opti.subject_to(ca.norm_2(x[:2,t] + ref_state[t][:2,0] -ca.MX([1,2]))>0.5)
-        # if(x[2,t] + ref_state[t][2,0] > np.pi):
-            
-        # opti.subject_to(x[2,t] + ref_state[t][2,0] >= -ca.pi)
-        # opti.subject_to(x[2,t] + ref_state[t][2,0]< ca.pi)
-        opti.subject_to(x[0,t]+ ref_state[t][0,0] >=-3)
-        opti.subject_to(x[1,t]+ ref_state[t][1,0] >=-3)
-        opti.subject_to(x[0,t]+ ref_state[t][0,0] <=3)
-        opti.subject_to(x[1,t]+ ref_state[t][1,0] <=3)
+        # The measured state is fixed; constrain only states the controls can change.
+        for t in range(1, horizon + 1):
+            opti.subject_to(opti.bounded(-3, x[:2, t], 3))
+            for center in ([-2, -2], [1, 2]):
+                opti.subject_to(
+                    ca.sumsqr(x[:2, t] - ca.DM(center)) >= (0.5 + obstacle_clearance)**2
+                )
+        opti.subject_to(opti.bounded(v_min, u[0, :], v_max))
+        opti.subject_to(opti.bounded(w_min, u[1, :], w_max))
+        opti.solver('ipopt', {'print_time': False}, {'print_level': 0, 'sb': 'yes'})
 
-        opti.subject_to(u_t[0,t] >= 0)
-        opti.subject_to(u_t[0,t] <= 1)
-        opti.subject_to(u_t[1,t] >= -1)
-        opti.subject_to(u_t[1,t] <= 1)
-        
-    
-    opti.solver('ipopt')
-    sol = opti.solve()
-    u_opt = sol.value(u_t)
-    return u_opt[:,0]
-    
+    def __call__(self, cur_state, iteration):
+        reference = np.array([
+            lissajous(iteration + t) for t in range(self.horizon + 1)
+        ]).T
+        self.opti.set_value(self.initial_state, cur_state)
+        self.opti.set_value(self.reference, reference)
+
+        if self.previous_controls is None:
+            displacement = np.diff(reference[:2], axis=1)
+            heading = reference[2, :-1]
+            speed = (displacement[0] * np.cos(heading)
+                     + displacement[1] * np.sin(heading)) / time_step
+            angle_change = np.diff(reference[2])
+            turn_rate = ((angle_change + np.pi) % (2 * np.pi) - np.pi) / time_step
+            controls = np.vstack((
+                np.clip(speed, v_min, v_max),
+                np.clip(turn_rate, w_min, w_max),
+            ))
+        else:
+            controls = np.column_stack((
+                self.previous_controls[:, 1:], self.previous_controls[:, -1]
+            ))
+
+        # Roll out from the measured state; the previous prediction omits process noise.
+        states = np.empty((3, self.horizon + 1))
+        states[:, 0] = cur_state
+        for t in range(self.horizon):
+            theta = states[2, t]
+            states[:, t + 1] = states[:, t] + time_step * np.array([
+                controls[0, t] * np.cos(theta),
+                controls[0, t] * np.sin(theta),
+                controls[1, t],
+            ])
+        self.opti.set_initial(self.x, states)
+        self.opti.set_initial(self.u, controls)
+        solution = self.opti.solve()
+        self.previous_controls = np.asarray(solution.value(self.u)).reshape(2, self.horizon)
+        return self.previous_controls[:, 0].copy()
+
+
+_cec_optimizer = None
+
+
+def cec_controller(cur_state, iteration):
+    global _cec_optimizer
+    if _cec_optimizer is None:
+        _cec_optimizer = CECController()
+    return _cec_optimizer(cur_state, iteration)
 
 # def error_next_state(err_state,iter,cur_state,control,noise):
 #     ref_state = lissajous(iter)
@@ -122,10 +155,8 @@ def car_next_state(time_step, cur_state, control, noise = True):
     theta = cur_state[2]
     rot_3d_z = np.array([[np.cos(theta), 0], [np.sin(theta), 0], [0, 1]])
     f = rot_3d_z @ control
-    mu, sigma = 0, 0.04 # mean and standard deviation for (x,y)
-    w_xy = np.random.normal(mu, sigma, 2)
-    mu, sigma = 0, 0.004  # mean and standard deviation for theta
-    w_theta = np.random.normal(mu, sigma, 1)
+    w_xy = np.random.normal(0, position_noise_std, 2)
+    w_theta = np.random.normal(0, heading_noise_std, 1)
     w = np.concatenate((w_xy, w_theta))
     if noise:
         return cur_state + time_step*f.flatten() + w
@@ -156,6 +187,9 @@ if __name__ == '__main__':
         # Save current state and reference state for visualization
         ref_traj.append(cur_ref)
         car_states.append(cur_state)
+        tracking_error = cur_state - np.array(cur_ref)
+        tracking_error[2] = (tracking_error[2] + np.pi) % (2 * np.pi) - np.pi
+        error += np.linalg.norm(tracking_error)
 
         ################################################################
         # Generate control input
@@ -175,7 +209,6 @@ if __name__ == '__main__':
         print(cur_iter)
         print(t2-t1)
         times.append(t2-t1)
-        error = error + np.linalg.norm(cur_state - cur_ref)
         cur_iter = cur_iter + 1
 
     main_loop_time = time()
