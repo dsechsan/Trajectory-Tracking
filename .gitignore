@@ -1,2 +1,3 @@
 *.zip
 starter_code/*.npy
+.venv/

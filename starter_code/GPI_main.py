@@ -10,6 +10,9 @@ from numba import njit
 PERIOD = 100
 DT = 0.5
 SIGMA = np.array([0.04, 0.04, 0.004])
+OBSTACLES = np.array([[-2, -2, 0.5], [1, 2, 0.5]])
+SAFETY_MARGIN = 0.15
+EFFORT_WEIGHT = 0.1
 
 
 def lissajous(k):
@@ -26,20 +29,50 @@ def _position_grid(n):
     return 3 * points * np.abs(points)
 
 
+@njit
+def _stencil(grid, means, sigma, periodic):
+    indices = np.zeros((len(means), 6), dtype=np.int32)
+    weights = np.zeros((len(means), 6))
+    offsets = np.array([-np.sqrt(3.0), 0.0, np.sqrt(3.0)])
+    probabilities = np.array([1 / 6, 2 / 3, 1 / 6])
+    for k in range(len(means)):
+        count = 0
+        for sample in range(3):
+            point = means[k] + sigma * offsets[sample]
+            if periodic:
+                point = (point + np.pi) % (2 * np.pi) - np.pi
+                lo = np.searchsorted(grid, point, side='right') - 1
+                hi = (lo + 1) % len(grid)
+                upper_point = np.pi if hi == 0 else grid[hi]
+                upper = (point - grid[lo]) / (upper_point - grid[lo])
+            elif point <= grid[0]:
+                lo = hi = 0
+                upper = 0.0
+            elif point >= grid[-1]:
+                lo = hi = len(grid) - 1
+                upper = 0.0
+            else:
+                lo = np.searchsorted(grid, point, side='right') - 1
+                hi = lo + 1
+                upper = (point - grid[lo]) / (grid[hi] - grid[lo])
+            for idx, weight in ((lo, 1 - upper), (hi, upper)):
+                weight *= probabilities[sample]
+                if weight > 0:
+                    slot = 0
+                    while slot < count and indices[k, slot] != idx:
+                        slot += 1
+                    if slot == count:
+                        indices[k, slot] = idx
+                        count += 1
+                    weights[k, slot] += weight
+    return indices, weights
+
+
 def _neighbors(grid, mean, sigma, periodic=False):
-    """Lower index and upper probability on a two-point Gaussian stencil."""
-    if periodic:
-        mean = (mean + np.pi) % (2 * np.pi) - np.pi
-        axis = np.r_[grid, np.pi]  # upper seam neighbor is grid[0]
-    else:
-        mean = np.clip(mean, grid[0], grid[-1])
-        axis = grid
-    lo = np.clip(np.searchsorted(axis, mean, side='right') - 1, 0, len(axis) - 2)
-    a, b = axis[lo], axis[lo + 1]
-    # Logistic of the log likelihood ratio avoids underflow for small sigma.
-    log_ratio = (b - a) * (mean - (a + b) / 2) / sigma**2
-    upper = np.exp(-np.logaddexp(0, -log_ratio))
-    return lo.astype(np.int32), upper
+    """Interpolate three Gaussian quadrature samples onto the grid."""
+    indices, weights = _stencil(grid, np.asarray(mean).ravel(), sigma, periodic)
+    shape = np.shape(mean) + (6,)
+    return indices.reshape(shape), weights.reshape(shape)
 
 
 @njit
@@ -60,19 +93,25 @@ def _sweep(value, policy, state_cost, effort, xt, yt, ht, gamma, evaluate, updat
                     best = np.inf
                     for v in range(action // nw if evaluate else 0,
                                    action // nw + 1 if evaluate else nv):
-                        x, px = xi[t, h, i, v], xp[t, h, i, v]
-                        y, py = yi[t, h, j, v], yp[t, h, j, v]
                         for w in range(action % nw if evaluate else 0,
                                        action % nw + 1 if evaluate else nw):
-                            z, pz = hi[t, h, w], hp[t, h, w]
-                            zz = (z + 1) % nh
-                            # The joint weight factors across independent noise axes.
                             ev = 0.0
-                            for dx in range(2):
-                                for dy in range(2):
-                                    row = nxt[x + dx, y + dy]
-                                    ev += ((px if dx else 1 - px) * (py if dy else 1 - py)
-                                           * ((1 - pz) * row[z] + pz * row[zz]))
+                            for dx in range(6):
+                                px = xp[t, h, i, v, dx]
+                                if px == 0:
+                                    break
+                                x = xi[t, h, i, v, dx]
+                                for dy in range(6):
+                                    py = yp[t, h, j, v, dy]
+                                    if py == 0:
+                                        break
+                                    y = yi[t, h, j, v, dy]
+                                    row = nxt[x, y]
+                                    for dh in range(6):
+                                        ph = hp[t, h, w, dh]
+                                        if ph == 0:
+                                            break
+                                        ev += px * py * ph * row[hi[t, h, w, dh]]
                             q = effort[v, w] + gamma * ev
                             if q < best:
                                 best = q
@@ -94,7 +133,7 @@ class GPI:
         self.x, self.y = _position_grid(nx), _position_grid(ny)
         self.heading = np.linspace(-np.pi, np.pi, nth, endpoint=False)
         self.v, self.w = np.linspace(0, 1, nv), np.linspace(-1, 1, nw)
-        self.effort = self.v[:, None]**2 + self.w**2
+        self.effort = EFFORT_WEIGHT * (self.v[:, None]**2 + self.w**2)
         self.ref = lissajous(np.arange(PERIOD))
         drift = self.ref - np.roll(self.ref, -1, axis=0)
         theta = self.ref[:, 2, None] + self.heading
@@ -111,8 +150,8 @@ class GPI:
         wx = self.x[None, :, None] + self.ref[:, 0, None, None]
         wy = self.y[None, None, :] + self.ref[:, 1, None, None]
         unsafe = (np.abs(wx) > 3) | (np.abs(wy) > 3)
-        for cx, cy in [(-2, -2), (1, 2)]:
-            unsafe |= (wx - cx)**2 + (wy - cy)**2 <= 0.5**2
+        for cx, cy, r in OBSTACLES:
+            unsafe |= (wx - cx)**2 + (wy - cy)**2 <= (r + SAFETY_MARGIN)**2
         position_cost = self.x[:, None]**2 + self.y**2 + 1000 * unsafe
         self.state_cost = position_cost[..., None] + (1 - np.cos(self.heading))**2
         self.policy = None
@@ -168,6 +207,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--method', choices=['value', 'policy'], default='value')
     parser.add_argument('--output', default='policy.npy')
+    parser.add_argument('--no-plot', action='store_true', help='skip the trajectory animation')
     args = parser.parse_args()
     start = perf_counter()
     model = GPI()
@@ -175,5 +215,9 @@ if __name__ == '__main__':
     print(f'{args.method}: {model.iterations} iterations, training and save: {perf_counter()-start:.2f} s')
     start = perf_counter()
     states = rollout(model)
-    error = np.linalg.norm(states[:, :2] - lissajous(np.arange(len(states)))[:, :2], axis=1)
+    ref_traj = lissajous(np.arange(len(states)))
+    error = np.linalg.norm(states[:, :2] - ref_traj[:, :2], axis=1)
     print(f'240-step rollout: {perf_counter()-start:.3f} s; mean position error: {error.mean():.3f}')
+    if not args.no_plot:
+        from utils import visualize
+        visualize(states, ref_traj, OBSTACLES, np.arange(len(states)), DT)
