@@ -10,4 +10,33 @@ This file contains examples of how to generate control inputs from a simple P co
 
 ### 2. GPI_main.py
 
-This file contains the generalized policy iteration implementation to track the given trajectory. 
+Part 2 implements both **discounted value iteration** and **policy iteration**
+on the same periodic tracking-error MDP, as allowed in `ECE276B_PR3.pdf`.
+Run either solver from the repository root:
+
+```sh
+python -m pip install numpy numba
+python starter_code/GPI_main.py --method value --output value_policy.npy
+python starter_code/GPI_main.py --method policy --output pi_policy.npy
+```
+
+Both use 100 phases, a 20 x 20 x 20 error grid and 10 x 20 controls. Position
+bins are finer near zero. The heading and phase wrap; position means beyond the
+error grid are clipped to its boundary. Each action considers the eight grid
+corners bracketing its predicted next error. With independent Gaussian noise,
+the normalized joint probabilities factor into three pairs of weights, so only
+one-dimensional neighbor indices and weights need to be stored. Neither method
+constructs the original 10.24 TB transition array or a full state-action cost table.
+
+The discounted objective uses `gamma=0.95`, identity position and control
+weights, and the project's `(1 - cos(heading_error))**2` penalty. An additional
+1000 cost applies at unsafe **world positions**; this discourages collisions
+but does not guarantee avoidance on a noisy continuous rollout. Policy iteration
+evaluates the current policy to tolerance before a greedy improvement; value
+iteration uses greedy backups throughout. Both require a final optimal Bellman
+residual at most `1e-4` by default.
+
+Each command saves an integer action-index array, then runs a seeded, noisy
+240-step tracking simulation. To reuse a saved policy with the same grid, set
+`model = GPI()` and `model.policy = np.load("value_policy.npy")`; call
+`model.control(step, world_state)` for the linear and angular velocity.
